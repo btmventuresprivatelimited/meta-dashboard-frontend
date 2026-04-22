@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 
-const API_BASE = "http://localhost:4000/api/meta";
+const API_BASE = "https://meta-dashboard-backend-2wmr.onrender.com/api/meta";
 const METRIC_KEYS = new Set([
   "spend",
   "reach",
