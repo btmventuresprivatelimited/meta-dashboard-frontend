@@ -1,4 +1,4 @@
-const API_BASE = "https://meta-dashboard-backend-2wmr.onrender.com";
+const API_BASE = "https://meta-dashboard-backend-2wmr.onrender.com/";
 
 export async function fetchAdAccounts() {
   const response = await fetch(`${API_BASE}/accounts`);
