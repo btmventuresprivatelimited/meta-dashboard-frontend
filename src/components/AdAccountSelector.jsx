@@ -1,11 +1,47 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 const API_BASE = "https://meta-dashboard-backend-2wmr.onrender.com/api/meta";
-const METRIC_KEYS = new Set(["spend","reach","impressions","clicks","ctr","cpc","roas"]);
+const METRIC_KEYS = new Set(["spend","reach","impressions","clicks","ctr","cpc","roas","cpm","cpr","results"]);
 
 function toNumber(value) {
   if (Array.isArray(value)) { const f = value[0]; if (f && typeof f==="object") { const n=Number(f.value); return isNaN(n)?0:n; } }
   const n=Number(value); return isNaN(n)?0:n;
+}
+
+
+// Priority order for Meta "Results" — matches what Ads Manager shows
+// as the primary result depending on campaign objective
+const RESULT_PRIORITY = [
+  "omni_purchase",
+  "purchase",
+  "offsite_conversion.fb_pixel_purchase",
+  "app_custom_event.fb_mobile_purchase",
+  "lead",
+  "offsite_conversion.fb_pixel_lead",
+  "link_click",
+  "post_engagement",
+  "page_engagement",
+];
+
+// Pick the most relevant action count from Meta's actions array
+function extractResults(actionsArr) {
+  if (!Array.isArray(actionsArr)) return 0;
+  for (const type of RESULT_PRIORITY) {
+    const match = actionsArr.find(a => a.action_type === type);
+    if (match) return toNumber(match.value);
+  }
+  return 0;
+}
+
+// Pick cost per result directly from Meta's cost_per_action_type array
+// This exactly matches what Meta Ads Manager shows as "Cost per Result"
+function extractCPR(costArr) {
+  if (!Array.isArray(costArr)) return 0;
+  for (const type of RESULT_PRIORITY) {
+    const match = costArr.find(a => a.action_type === type);
+    if (match) return toNumber(match.value);
+  }
+  return 0;
 }
 
 function fmt(key, val) {
@@ -16,7 +52,9 @@ function fmt(key, val) {
     case "budget":return val.toLocaleString("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:0});
     case "ctr":   return `${val.toFixed(2)}%`;
     case "roas":  return `${val.toFixed(2)}x`;
-    case "reach": case "impressions": case "clicks": return val.toLocaleString("en-IN");
+    case "cpm":   return val.toLocaleString("en-IN",{style:"currency",currency:"INR",minimumFractionDigits:2,maximumFractionDigits:2});
+    case "cpr":   return val.toLocaleString("en-IN",{style:"currency",currency:"INR",minimumFractionDigits:2,maximumFractionDigits:2});
+    case "reach": case "impressions": case "clicks": case "results": return val.toLocaleString("en-IN");
     default: return String(val);
   }
 }
@@ -36,6 +74,7 @@ async function fetchJson(url) {
   if(!res.ok||!result.success) throw new Error(result.message||"Request failed");
   return result.data||[];
 }
+
 
 const COUNTRY_NAMES={IN:"India",US:"United States",GB:"United Kingdom",AE:"UAE",SG:"Singapore",AU:"Australia",CA:"Canada",DE:"Germany",FR:"France",JP:"Japan",NL:"Netherlands",MY:"Malaysia",TH:"Thailand",PH:"Philippines",ID:"Indonesia",BD:"Bangladesh",PK:"Pakistan"};
 const countryName=(c)=>COUNTRY_NAMES[c]||c;
@@ -196,18 +235,25 @@ export default function MetaAccountSelectorPage() {
         ]);
         if(ignore) return;
         const insightMap=new Map();
-        for(const row of insights) {
-          const k=row.campaign_id;
-          const ex=insightMap.get(k)||{spend:0,reach:0,impressions:0,clicks:0,ctr:0,cpc:0,roas:0};
-          ex.spend+=toNumber(row.spend); ex.reach+=toNumber(row.reach);
-          ex.impressions+=toNumber(row.impressions); ex.clicks+=toNumber(row.clicks);
-          ex.ctr=toNumber(row.ctr); ex.cpc=toNumber(row.cpc);
-          ex.roas=toNumber(row.purchase_roas)||toNumber(row.website_purchase_roas);
-          insightMap.set(k,ex);
-        }
-        const merged=meta.map(c=>{const m=insightMap.get(c.id)||{}; return {campaign_id:c.id,campaign_name:c.name,objective:c.objective||"—",status:c.effective_status||c.status||"—",spend:m.spend??0,reach:m.reach??0,impressions:m.impressions??0,clicks:m.clicks??0,ctr:m.ctr??0,cpc:m.cpc??0,roas:m.roas??0};});
-        setCampaigns(merged);
-        if(merged.length>0) setSelectedCampaignId(merged[0].campaign_id);
+        for(const row of insights) insightMap.set(row.campaign_id, row);
+        const merged=meta.map(c=>{
+          const m=insightMap.get(c.id)||{};
+          return {
+            campaign_id:c.id, campaign_name:c.name,
+            objective:c.objective||"—", status:c.effective_status||c.status||"—",
+            spend:       toNumber(m.spend),
+            roas:        toNumber(m.purchase_roas)||toNumber(m.website_purchase_roas),
+            results:     extractResults(m.actions),
+            reach:       toNumber(m.reach),
+            impressions: toNumber(m.impressions),
+            clicks:      toNumber(m.clicks),
+            ctr:         toNumber(m.ctr),
+            cpc:         toNumber(m.cpc),
+            cpm:         toNumber(m.cpm),
+            cpr:         extractCPR(m.cost_per_action_type),
+          };
+        });
+        setCampaigns(merged);        if(merged.length>0) setSelectedCampaignId(merged[0].campaign_id);
       } catch(e) { if(!ignore) setCampaignsError(e.message||"Failed to load campaigns"); }
       finally { if(!ignore) setCampaignsLoading(false); }
     })();
@@ -227,17 +273,31 @@ export default function MetaAccountSelectorPage() {
           fetchJson(`${API_BASE}/insights/adsets?accountId=${encodeURIComponent(selectedAccountId)}&from=${dateRange.from}&to=${dateRange.to}&campaignId=${encodeURIComponent(selectedCampaignId)}`),
         ]);
         if(ignore) return;
+        // Direct map — Meta pre-aggregates for the period, all metrics match Ads Manager
         const insightMap=new Map();
-        for(const row of adsetInsights) {
-          const k=row.adset_id;
-          const ex=insightMap.get(k)||{spend:0,reach:0,impressions:0,clicks:0,ctr:0,cpc:0,roas:0};
-          ex.spend+=toNumber(row.spend); ex.reach+=toNumber(row.reach);
-          ex.impressions+=toNumber(row.impressions); ex.clicks+=toNumber(row.clicks);
-          ex.ctr=toNumber(row.ctr); ex.cpc=toNumber(row.cpc);
-          ex.roas=toNumber(row.purchase_roas)||toNumber(row.website_purchase_roas);
-          insightMap.set(k,ex);
-        }
-        const merged=adsetMeta.map(a=>{const m=insightMap.get(a.id)||{}; return {adset_id:a.id,adset_name:a.name,status:a.effective_status||a.status||"—",daily_budget:a.daily_budget?toNumber(a.daily_budget)/100:null,lifetime_budget:a.lifetime_budget?toNumber(a.lifetime_budget)/100:null,bid_strategy:a.bid_strategy||null,optimization_goal:a.optimization_goal||null,targeting:a.targeting||null,spend:m.spend??0,reach:m.reach??0,impressions:m.impressions??0,clicks:m.clicks??0,ctr:m.ctr??0,cpc:m.cpc??0,roas:m.roas??0};});
+        for(const row of adsetInsights) insightMap.set(row.adset_id, row);
+        const merged=adsetMeta.map(a=>{
+          const m=insightMap.get(a.id)||{};
+          return {
+            adset_id:a.id, adset_name:a.name,
+            status:a.effective_status||a.status||"—",
+            daily_budget:      a.daily_budget    ? toNumber(a.daily_budget)/100    : null,
+            lifetime_budget:   a.lifetime_budget ? toNumber(a.lifetime_budget)/100 : null,
+            bid_strategy:      a.bid_strategy    || null,
+            optimization_goal: a.optimization_goal || null,
+            targeting:         a.targeting || null,
+            spend:       toNumber(m.spend),
+            roas:        toNumber(m.purchase_roas)||toNumber(m.website_purchase_roas),
+            results:     extractResults(m.actions),
+            reach:       toNumber(m.reach),
+            impressions: toNumber(m.impressions),
+            clicks:      toNumber(m.clicks),
+            ctr:         toNumber(m.ctr),
+            cpc:         toNumber(m.cpc),
+            cpm:         toNumber(m.cpm),
+            cpr:         extractCPR(m.cost_per_action_type),
+          };
+        });
         setAdsets(merged);
         if(merged.length>0) setSelectedAdsetId(merged[0].adset_id);
       } catch(e) { if(!ignore) setAdsetsError(e.message||"Failed to load ad sets"); }
@@ -255,7 +315,23 @@ export default function MetaAccountSelectorPage() {
         setAdsLoading(true); setAdsError("");
         const rows=await fetchJson(`${API_BASE}/insights/ads?accountId=${encodeURIComponent(selectedAccountId)}&from=${dateRange.from}&to=${dateRange.to}&adsetId=${encodeURIComponent(selectedAdsetId)}`);
         if(ignore) return;
-        setAds(rows.map(r=>({ad_id:r.ad_id,ad_name:r.ad_name,adset_id:r.adset_id,adset_name:r.adset_name,spend:toNumber(r.spend),reach:toNumber(r.reach),impressions:toNumber(r.impressions),clicks:toNumber(r.clicks),ctr:toNumber(r.ctr),cpc:toNumber(r.cpc),roas:toNumber(r.purchase_roas)||toNumber(r.website_purchase_roas)})));
+        // All values come directly from Meta — no client-side ratio calculation
+        setAds(rows.map(r=>({
+          ad_id:       r.ad_id,
+          ad_name:     r.ad_name,
+          adset_id:    r.adset_id,
+          adset_name:  r.adset_name,
+          spend:       toNumber(r.spend),
+          roas:        toNumber(r.purchase_roas)||toNumber(r.website_purchase_roas),
+          results:     extractResults(r.actions),
+          reach:       toNumber(r.reach),
+          impressions: toNumber(r.impressions),
+          clicks:      toNumber(r.clicks),
+          ctr:         toNumber(r.ctr),
+          cpc:         toNumber(r.cpc),
+          cpm:         toNumber(r.cpm),
+          cpr:         extractCPR(r.cost_per_action_type),
+        })));
       } catch(e) { if(!ignore) setAdsError(e.message||"Failed to load ads"); }
       finally { if(!ignore) setAdsLoading(false); }
     })();
@@ -432,12 +508,15 @@ export default function MetaAccountSelectorPage() {
                 <SortableHeader label="Objective" sortKey="objective" section="campaign" sortState={campaignSort} onSort={toggleSort}/>
                 <SortableHeader label="Status" sortKey="status" section="campaign" sortState={campaignSort} onSort={toggleSort}/>
                 <SortableHeader label="Spend" sortKey="spend" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
+                <SortableHeader label="ROAS" sortKey="roas" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
+                <SortableHeader label="Results" sortKey="results" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
                 <SortableHeader label="Reach" sortKey="reach" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
                 <SortableHeader label="Impressions" sortKey="impressions" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
                 <SortableHeader label="Clicks" sortKey="clicks" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
                 <SortableHeader label="CTR" sortKey="ctr" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
                 <SortableHeader label="CPC" sortKey="cpc" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
-                <SortableHeader label="ROAS" sortKey="roas" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
+                <SortableHeader label="CPM" sortKey="cpm" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
+                <SortableHeader label="CPR" sortKey="cpr" section="campaign" sortState={campaignSort} onSort={toggleSort} right/>
               </tr></thead>
               <tbody>
                 {campaignsLoading?<LoadingRow colSpan={11}/>:sortedCampaigns.length===0?<EmptyRow colSpan={11} msg="No campaigns found."/>:sortedCampaigns.map((c,i)=>{
@@ -448,12 +527,15 @@ export default function MetaAccountSelectorPage() {
                     <td className="cell">{c.objective}</td>
                     <td className="cell"><StatusBadge status={c.status}/></td>
                     <td className="cell cell-num metric-spend">{fmt("spend",c.spend)}</td>
+                    <td className="cell cell-num">{fmt("roas",c.roas)}</td>
+                    <td className="cell cell-num">{fmt("results",c.results)}</td>
                     <td className="cell cell-num">{fmt("reach",c.reach)}</td>
                     <td className="cell cell-num">{fmt("impressions",c.impressions)}</td>
                     <td className="cell cell-num">{fmt("clicks",c.clicks)}</td>
                     <td className="cell cell-num">{fmt("ctr",c.ctr)}</td>
                     <td className="cell cell-num">{fmt("cpc",c.cpc)}</td>
-                    <td className="cell cell-num">{fmt("roas",c.roas)}</td>
+                    <td className="cell cell-num">{fmt("cpm",c.cpm)}</td>
+                    <td className="cell cell-num">{fmt("cpr",c.cpr)}</td>
                   </tr>);
                 })}
               </tbody>
@@ -463,7 +545,7 @@ export default function MetaAccountSelectorPage() {
                 <td className="cell cell-num">{fmt("reach",campaignTotals.reach)}</td>
                 <td className="cell cell-num">{fmt("impressions",campaignTotals.impressions)}</td>
                 <td className="cell cell-num">{fmt("clicks",campaignTotals.clicks)}</td>
-                <td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/>
+                <td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/>
               </tr></tfoot>)}
             </table>
           </div>
@@ -492,12 +574,15 @@ export default function MetaAccountSelectorPage() {
                   <th className="sheets-th text-right">Budget</th>
                   <th className="sheets-th">Bid Strategy</th>
                   <SortableHeader label="Spend" sortKey="spend" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
+                  <SortableHeader label="ROAS" sortKey="roas" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
+                  <SortableHeader label="Results" sortKey="results" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
                   <SortableHeader label="Reach" sortKey="reach" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
                   <SortableHeader label="Impressions" sortKey="impressions" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
                   <SortableHeader label="Clicks" sortKey="clicks" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
                   <SortableHeader label="CTR" sortKey="ctr" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
                   <SortableHeader label="CPC" sortKey="cpc" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
-                  <SortableHeader label="ROAS" sortKey="roas" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
+                  <SortableHeader label="CPM" sortKey="cpm" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
+                  <SortableHeader label="CPR" sortKey="cpr" section="adset" sortState={adsetSort} onSort={toggleSort} right/>
                 </tr></thead>
                 <tbody>
                   {adsetsLoading?<LoadingRow colSpan={12}/>:sortedAdsets.length===0?<EmptyRow colSpan={12} msg="No ad sets found."/>:sortedAdsets.map((a,i)=>{
@@ -510,12 +595,15 @@ export default function MetaAccountSelectorPage() {
                       <td className="cell cell-num">{budget}</td>
                       <td className="cell"><span className="bid-chip">{a.bid_strategy?.replace(/_/g," ")||"—"}</span></td>
                       <td className="cell cell-num metric-spend">{fmt("spend",a.spend)}</td>
+                      <td className="cell cell-num">{fmt("roas",a.roas)}</td>
+                      <td className="cell cell-num">{fmt("results",a.results)}</td>
                       <td className="cell cell-num">{fmt("reach",a.reach)}</td>
                       <td className="cell cell-num">{fmt("impressions",a.impressions)}</td>
                       <td className="cell cell-num">{fmt("clicks",a.clicks)}</td>
                       <td className="cell cell-num">{fmt("ctr",a.ctr)}</td>
                       <td className="cell cell-num">{fmt("cpc",a.cpc)}</td>
-                      <td className="cell cell-num">{fmt("roas",a.roas)}</td>
+                      <td className="cell cell-num">{fmt("cpm",a.cpm)}</td>
+                      <td className="cell cell-num">{fmt("cpr",a.cpr)}</td>
                     </tr>);
                   })}
                 </tbody>
@@ -525,7 +613,7 @@ export default function MetaAccountSelectorPage() {
                   <td className="cell cell-num">{fmt("reach",adsetTotals.reach)}</td>
                   <td className="cell cell-num">{fmt("impressions",adsetTotals.impressions)}</td>
                   <td className="cell cell-num">{fmt("clicks",adsetTotals.clicks)}</td>
-                  <td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/>
+                  <td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/>
                 </tr></tfoot>)}
               </table>
             </div>
@@ -553,12 +641,15 @@ export default function MetaAccountSelectorPage() {
                     <th className="sheets-th row-num-th">#</th>
                     <SortableHeader label="Ad Name" sortKey="ad_name" section="ad" sortState={adSort} onSort={toggleSort}/>
                     <SortableHeader label="Spend" sortKey="spend" section="ad" sortState={adSort} onSort={toggleSort} right/>
+                    <SortableHeader label="ROAS" sortKey="roas" section="ad" sortState={adSort} onSort={toggleSort} right/>
+                    <SortableHeader label="Results" sortKey="results" section="ad" sortState={adSort} onSort={toggleSort} right/>
                     <SortableHeader label="Reach" sortKey="reach" section="ad" sortState={adSort} onSort={toggleSort} right/>
                     <SortableHeader label="Impressions" sortKey="impressions" section="ad" sortState={adSort} onSort={toggleSort} right/>
                     <SortableHeader label="Clicks" sortKey="clicks" section="ad" sortState={adSort} onSort={toggleSort} right/>
                     <SortableHeader label="CTR" sortKey="ctr" section="ad" sortState={adSort} onSort={toggleSort} right/>
                     <SortableHeader label="CPC" sortKey="cpc" section="ad" sortState={adSort} onSort={toggleSort} right/>
-                    <SortableHeader label="ROAS" sortKey="roas" section="ad" sortState={adSort} onSort={toggleSort} right/>
+                    <SortableHeader label="CPM" sortKey="cpm" section="ad" sortState={adSort} onSort={toggleSort} right/>
+                    <SortableHeader label="CPR" sortKey="cpr" section="ad" sortState={adSort} onSort={toggleSort} right/>
                   </tr></thead>
                   <tbody>
                     {adsLoading?<LoadingRow colSpan={9}/>:sortedAds.length===0?<EmptyRow colSpan={9} msg="No ads found for this ad set and date range."/>:sortedAds.map((ad,i)=>(
@@ -566,12 +657,15 @@ export default function MetaAccountSelectorPage() {
                         <td className="cell row-num">{i+1}</td>
                         <td className="cell cell-name">{ad.ad_name}</td>
                         <td className="cell cell-num metric-spend">{fmt("spend",ad.spend)}</td>
+                        <td className="cell cell-num">{fmt("roas",ad.roas)}</td>
+                        <td className="cell cell-num">{fmt("results",ad.results)}</td>
                         <td className="cell cell-num">{fmt("reach",ad.reach)}</td>
                         <td className="cell cell-num">{fmt("impressions",ad.impressions)}</td>
                         <td className="cell cell-num">{fmt("clicks",ad.clicks)}</td>
                         <td className="cell cell-num">{fmt("ctr",ad.ctr)}</td>
                         <td className="cell cell-num">{fmt("cpc",ad.cpc)}</td>
-                        <td className="cell cell-num">{fmt("roas",ad.roas)}</td>
+                        <td className="cell cell-num">{fmt("cpm",ad.cpm)}</td>
+                        <td className="cell cell-num">{fmt("cpr",ad.cpr)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -581,7 +675,7 @@ export default function MetaAccountSelectorPage() {
                     <td className="cell cell-num">{fmt("reach",adTotals.reach)}</td>
                     <td className="cell cell-num">{fmt("impressions",adTotals.impressions)}</td>
                     <td className="cell cell-num">{fmt("clicks",adTotals.clicks)}</td>
-                    <td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/>
+                    <td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/><td className="cell cell-num"/>
                   </tr></tfoot>)}
                 </table>
               </div>
